@@ -12,9 +12,9 @@ Windows only. You need a phone that can pair the remote.
 
 Wireless debugging is not a harmless switch. While it is on, a computer on that network can run commands on the phone: install and remove apps, read files, and control the screen. This project uses that channel to read the remote. Anyone else who pairs with the phone on the same network can do the same things.
 
-Turn **Wireless debugging** off when you are finished, and leave it off when you are away from home. `setup.bat` stops and asks you to type `YES` before it will pair.
+Turn **Wireless debugging** off when you are finished, and leave it off away from home. It has to stay on while the remote is controlling this PC. `setup.bat` stops and asks you to type `YES` before it will pair.
 
-A VPN that blocks the local network, such as GlobalProtect, will also stop the PC from reaching the phone. Turn that off while you use the remote.
+A VPN that blocks the local network will stop the PC from reaching the phone. Turn the VPN off while you use the remote.
 
 ## What you need
 
@@ -29,53 +29,40 @@ A VPN that blocks the local network, such as GlobalProtect, will also stop the P
 
 Install Python 3 from [python.org](https://www.python.org/downloads/) and turn on **Add python.exe to PATH**. Skip the Microsoft Store alias if Windows offers one.
 
-Be on your home Wi-Fi, or another private network. Clone the repo, then double-click `setup.bat`:
+On your home Wi-Fi, clone the repo and double-click `setup.bat`:
 
 ```bat
 git clone https://github.com/Param2596/ar-remote.git
 cd ar-remote
 ```
 
-`setup.bat` installs the tray libraries, downloads `adb` if it is missing, and puts a **Fire Remote** shortcut on the desktop and in Startup. The Startup shortcut comes up off, so the phone keeps the remote until you click the icon.
+`setup.bat` installs the tray libraries, downloads `adb` if it is missing, and puts a **Fire Remote** shortcut on the desktop and in Startup. The Startup shortcut comes up off, so the phone keeps the remote until you click the icon. Then it asks for the phone's pairing code. No cable.
 
-Then it pairs the phone over Wi-Fi. No cable.
+On the phone, before you type `YES`:
 
-On the phone:
-
-1. Turn on Developer options and **Wireless debugging**.
+1. Turn on Developer options and **Wireless debugging**. Leave it on.
 2. Pair the Fire remote in Bluetooth settings.
 3. Tap **Pair device with pairing code** and leave the popup open.
 4. Type the popup's IP, port, and 6-digit code into the setup window.
 
 The code expires quickly. If pairing fails, open the popup again. If the PC still cannot see the phone, close the popup and type the **IP address & Port** from the main Wireless debugging page.
 
-Click the round icon by the clock. Gray is off, green is on.
+Click the round icon by the clock. Gray is off, green is on. The icon is the switch from then on.
 
-To pair again later:
+To pair again later, double-click `setup.bat` or run `python ar_remote.py --pair`.
 
-```bat
-python ar_remote.py --pair
-```
-
-If nothing connects, run it in a window so you can read the error:
-
-```bat
-python ar_remote.py
-```
-
-`python ar_remote.py --list` prints the input devices the phone can see and exits. The remote usually shows up as `AR Keyboard`.
+If nothing connects, run `python ar_remote.py` in a window and read the error. `python ar_remote.py --list` prints the phone's input devices. The remote usually shows up as `AR Keyboard`.
 
 ## Daily use
 
-Leave these on whenever the tray icon is green, and only while you are on that private network:
+Leave these on while you want the remote on the PC:
 
+- **Wireless debugging.** Turning it off drops the connection.
 - Phone Bluetooth, with the remote connected
-- Wireless debugging
 - Phone and PC on the same home Wi-Fi
+- The VPN off, if it blocks the local network
 
-If you go somewhere else, turn Wireless debugging off before you join that network.
-
-Click the tray icon to turn forwarding on or off. Off means the remote goes back to the phone.
+Click the tray icon to turn forwarding on or off. Off means the remote goes back to the phone. Debugging can stay on while the icon is gray.
 
 Right-click the icon:
 
@@ -86,6 +73,8 @@ Right-click the icon:
 | Quit | Turns forwarding off and exits. |
 
 After the phone reboots, turn Wireless debugging back on, then click the tray icon off and on.
+
+When you are done, or when you leave home, turn Wireless debugging off.
 
 `run.bat` opens the tray app again with no console window. `setup.bat` is only for the first install.
 
@@ -135,6 +124,7 @@ These are created locally and are not in the repo:
 | --- | --- |
 | `endpoint.txt` | The phone's `ip:port` after the first connection |
 | `sound.txt` | Whether the mode sound is on |
+| `bridge.txt` | The private token between this PC and the phone |
 
 ## When it stops working
 

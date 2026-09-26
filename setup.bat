@@ -7,7 +7,8 @@ echo Use a private network you trust, such as your home Wi-Fi.
 echo A cafe, hotel, airport, school, or guest network is not safe.
 echo.
 echo Wireless debugging lets this PC run commands on the phone.
-echo Turn it off when you are done, and leave it off away from home.
+echo It has to stay on while the remote controls this PC.
+echo Turn it off when you are finished, and leave it off away from home.
 echo.
 pause
 where py >nul 2>&1

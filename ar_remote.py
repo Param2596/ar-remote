@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import argparse
 import re
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -26,6 +28,10 @@ PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-la
 ENDPOINT_FILE = Path(__file__).with_name("endpoint.txt")
 SOUND_FILE = Path(__file__).with_name("sound.txt")
 CHIME_FILE = Path(__file__).with_name("mode.wav")
+BRIDGE_FILE = Path(__file__).with_name("bridge.sh")
+BRIDGE_SESSION = Path(__file__).with_name("bridge-session.sh")
+BRIDGE_SECRET = Path(__file__).with_name("bridge.txt")
+BRIDGE_PORT = 47655
 REMOTE_NAME_HINTS = ("ar keyboard", "ar", "amazon", "fire tv", "firetv")
 
 # Linux evdev name -> (virtual-key, extended).
@@ -361,8 +367,8 @@ A cafe, hotel, airport, school, or guest network is not safe.
 Wireless debugging lets this PC run commands on the phone:
 install apps, read files, and control the screen. Anyone else
 on that same network who pairs with the phone can do the same.
-Turn Wireless debugging off when you are done, and leave it off
-away from home.
+It has to stay on while the remote controls this PC.
+Turn it off when you are finished, and leave it off away from home.
 """
 
 
@@ -808,25 +814,168 @@ def stream(serial: str, device: str, stop: threading.Event | None = None) -> Non
         run_adb(["-s", serial, "shell", "pkill grabevent"], timeout=5)
 
 
+def feed_buttons(pending: bytes, incoming: bytes, held: dict[str, tuple[int, bool]], seen_ignored: set[str]) -> bytes:
+    pending += incoming
+    while b"\n" in pending:
+        line, pending = pending.split(b"\n", 1)
+        match = re.search(rb"(\d+)\s+(\d+)", line)
+        if not match:
+            continue
+        code = int(match.group(1))
+        value = int(match.group(2))
+        name = CODE_TO_NAME.get(code, f"KEY_{code}")
+        action = {0: "UP", 1: "DOWN", 2: "REPEAT"}.get(value)
+        if action is None:
+            continue
+        apply_key(name, action, held, seen_ignored)
+    return pending
+
+
+def bridge_token() -> str:
+    if BRIDGE_SECRET.exists():
+        return BRIDGE_SECRET.read_text(encoding="utf-8").strip()
+    token = secrets.token_hex(16)
+    BRIDGE_SECRET.write_text(token, encoding="utf-8")
+    return token
+
+
+def pc_ip_toward(phone_host: str) -> str:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect((phone_host, 9))
+        return sock.getsockname()[0]
+    finally:
+        sock.close()
+
+
+def allow_bridge_port() -> None:
+    subprocess.run(
+        [
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            "name=Fire Remote bridge", "dir=in", "action=allow",
+            "protocol=TCP", f"localport={BRIDGE_PORT}",
+        ],
+        capture_output=True,
+        text=True,
+        creationflags=NO_WINDOW,
+    )
+
+
+def phone_bridge_alive(serial: str) -> bool:
+    text = adb_text(["-s", serial, "shell", "cat /data/local/tmp/bridge.pid"], timeout=8).strip()
+    if not text.isdigit():
+        return False
+    check = adb_text(["-s", serial, "shell", f"ls /proc/{text}"], timeout=8)
+    return "No such file" not in check and check.strip() != ""
+
+
+def start_phone_bridge(serial: str) -> None:
+    host = serial.split(":")[0] if ":" in serial else phone_ip(serial)
+    if not host:
+        raise SystemExit("Could not tell which IP the phone is using.")
+    pc_ip = pc_ip_toward(host)
+    token = bridge_token()
+    install_grabber(serial)
+    for local, remote in (
+        (BRIDGE_FILE, "/data/local/tmp/bridge.sh"),
+        (BRIDGE_SESSION, "/data/local/tmp/bridge-session.sh"),
+    ):
+        pushed = run_adb(["-s", serial, "push", str(local), remote])
+        if pushed.returncode != 0:
+            raise SystemExit(pushed.stdout + pushed.stderr)
+        run_adb(["-s", serial, "shell", f"chmod 755 {remote}"])
+    # Stop an older copy, then the adb-attached grabber, so the new one can take the remote.
+    run_adb(["-s", serial, "shell", "pid=$(cat /data/local/tmp/bridge.pid 2>/dev/null); [ -n \"$pid\" ] && kill $pid"], timeout=8)
+    run_adb(["-s", serial, "shell", "pkill grabevent"], timeout=5)
+    time.sleep(0.3)
+    run_adb(["-s", serial, "shell", f"sh /data/local/tmp/bridge.sh {pc_ip} {BRIDGE_PORT} {token}"], timeout=15)
+    time.sleep(0.6)
+    if phone_bridge_alive(serial):
+        say(f"Phone helper is running and will call this PC at {pc_ip}:{BRIDGE_PORT}.")
+        say("Phone helper is asleep until the remote connects over Bluetooth.")
+        say("Wireless debugging can be turned off. A phone reboot needs it on once, to start the helper again.")
+    else:
+        say("The phone helper did not stay running.")
+
+
+def ensure_phone_bridge() -> None:
+    """Start the on-phone helper when adb is up. If debugging is already off, just wait for it."""
+    try:
+        run_adb(["start-server"])
+        serial = choose_serial()
+    except SystemExit as exc:
+        say(str(exc))
+        say("Waiting for the phone helper. It keeps running after debugging is turned off.")
+        return
+    if phone_bridge_alive(serial):
+        say("Phone helper is already running.")
+        return
+    start_phone_bridge(serial)
+
+
+def serve_bridge(stop: threading.Event) -> None:
+    token = bridge_token().encode()
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", BRIDGE_PORT))
+    server.listen(1)
+    server.settimeout(0.5)
+    say(f"Listening for the phone on {BRIDGE_PORT}.")
+    release_stuck_keys()
+    try:
+        while not stop.is_set():
+            try:
+                conn, _addr = server.accept()
+            except (TimeoutError, socket.timeout):
+                continue
+            conn.settimeout(0.5)
+            held: dict[str, tuple[int, bool]] = {}
+            seen_ignored: set[str] = set()
+            pending = b""
+            authed = False
+            try:
+                while not stop.is_set():
+                    try:
+                        incoming = conn.recv(256)
+                    except (TimeoutError, socket.timeout):
+                        continue
+                    if not incoming:
+                        break
+                    if not authed:
+                        pending += incoming
+                        if b"\n" not in pending:
+                            continue
+                        line, pending = pending.split(b"\n", 1)
+                        if line.strip() != token:
+                            break
+                        authed = True
+                        say("Phone connected.")
+                        if not pending:
+                            continue
+                        incoming = b""
+                    pending = feed_buttons(pending, incoming, held, seen_ignored)
+            finally:
+                for vk, extended in list(held.values()):
+                    send_key(vk, extended, up=True)
+                release_stuck_keys()
+                conn.close()
+                if authed:
+                    say("Phone disconnected. The remote is back on the phone until it reconnects.")
+    finally:
+        server.close()
+
+
 def run_forever(stop: threading.Event) -> None:
-    run_adb(["start-server"])
+    allow_bridge_port()
+    threading.Thread(target=ensure_phone_bridge, daemon=True).start()
     while not stop.is_set():
         try:
-            serial = choose_serial()
-            path, name = find_remote(serial)
-            print(f"Phone {serial}")
-            print(f"Remote {name} at {path}")
-            install_grabber(serial)
-            release_stuck_keys()
-            stream(serial, path, stop)
-        except SystemExit as exc:
-            print(exc)
-        except Exception as exc:
-            if stop.is_set():
-                return
-            print(f"Stream dropped ({exc}). Reconnecting...")
-        if stop.wait(2):
+            serve_bridge(stop)
             return
+        except OSError as exc:
+            say(f"Listener stopped ({exc}). Retrying...")
+            if stop.wait(2):
+                return
 
 
 def tray_icon(on: bool):
@@ -931,33 +1080,20 @@ def main() -> None:
         serve_tray(args.on)
         return
 
-    run_adb(["start-server"])
-    serial = choose_serial()
-    path, name = find_remote(serial)
-    print(f"Phone {serial}")
-    print(f"Remote {name} at {path}")
     if args.list:
+        run_adb(["start-server"])
+        serial = choose_serial()
+        path, name = find_remote(serial)
+        print(f"Phone {serial}")
+        print(f"Remote {name} at {path}")
         return
-    install_grabber(serial)
-    release_stuck_keys()
+
     stop = threading.Event()
-    while not stop.is_set():
-        try:
-            stream(serial, path, stop)
-            return
-        except KeyboardInterrupt:
-            print("\nStopped.")
-            return
-        except Exception as exc:
-            print(f"Stream dropped ({exc}). Reconnecting...")
-            time.sleep(2)
-            try:
-                serial = choose_serial()
-                path, name = find_remote(serial)
-                print(f"Reconnected to {name} via {serial}")
-            except SystemExit as exit_exc:
-                print(exit_exc)
-                time.sleep(3)
+    try:
+        run_forever(stop)
+    except KeyboardInterrupt:
+        stop.set()
+        print("\nStopped.")
 
 
 if __name__ == "__main__":
