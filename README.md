@@ -80,17 +80,17 @@ When you are done, or when you leave home, turn Wireless debugging off.
 
 ## Buttons
 
-Alexa cycles three modes: **Controls**, **Volume**, **Cursor**. A label appears at the top of the screen. Holding a button keeps that key down. It does not trigger a separate long-press action. The remote's power, sleep, and mic buttons are ignored. The mic audio never leaves the remote.
+Alexa cycles three modes: **Controls**, **Volume**, **Cursor**. A label appears at the top of the screen. On the direction buttons and Menu, a tap does one step and holding repeats faster and faster. Other buttons stay down while held. Nothing uses a separate long-press action. The remote's power, sleep, and mic buttons are ignored. The mic audio never leaves the remote.
 
 ### Controls
 
 | Remote | Windows |
 | --- | --- |
-| Up, Down, Left, Right | Arrow keys |
+| Up, Down, Left, Right | Arrow keys. A tap is one step. Holding speeds it up. |
 | Center | Enter |
-| Back | Escape |
+| Back | Full screen (F11) |
 | Home | Windows key |
-| Menu | Menu key |
+| Menu | Tab. A tap is one step. Holding speeds it up. |
 | Play / Pause | Play / Pause |
 | Rewind, Fast forward | Previous track, Next track |
 | App shortcut (three lines) | Task View (Win+Tab) |
@@ -100,12 +100,12 @@ Alexa cycles three modes: **Controls**, **Volume**, **Cursor**. A label appears 
 
 | Remote | Windows |
 | --- | --- |
-| Up, Down | Volume up, Volume down |
-| Left, Right | Previous track, Next track |
+| Up, Down | Volume up, Volume down. A tap is one step. Holding speeds it up. |
+| Left, Right | Left arrow, Right arrow. A tap is one step. Holding speeds it up. |
 | Center | Mute |
 | Alexa | Next mode |
 
-Back, Home, Menu, and Play / Pause still do what they do in Controls.
+Home, Menu, Play / Pause, Rewind, and Fast forward still do what they do in Controls. Back is Escape here.
 
 ### Cursor
 

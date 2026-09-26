@@ -48,7 +48,7 @@ KEY_MAP: dict[str, tuple[int, bool]] = {
     "KEY_ESC": (0x1B, False),
     "KEY_HOME": (0x5B, True),
     "KEY_HOMEPAGE": (0x5B, True),
-    "KEY_MENU": (0x5D, True),
+    "KEY_MENU": (0x09, False),
     "KEY_PLAYPAUSE": (0xB3, False),
     "KEY_PLAY": (0xB3, False),
     "KEY_PAUSE": (0xB3, False),
@@ -70,13 +70,14 @@ CHORDS: dict[str, tuple[tuple[int, bool], ...]] = {
 VOLUME_MAP: dict[str, tuple[int, bool]] = {
     "KEY_UP": (0xAF, False),
     "KEY_DOWN": (0xAE, False),
-    "KEY_LEFT": (0xB1, False),
-    "KEY_RIGHT": (0xB0, False),
+    "KEY_LEFT": (0x25, True),
+    "KEY_RIGHT": (0x27, True),
     "KEY_ENTER": (0xAD, False),
     "KEY_SELECT": (0xAD, False),
     "KEY_KPENTER": (0xAD, False),
 }
 TAP_KEYS = {0xAD, 0xB0, 0xB1}
+REPEAT_KEYS = {"KEY_UP", "KEY_DOWN", "KEY_LEFT", "KEY_RIGHT", "KEY_MENU"}
 CURSOR_MOVE = {
     "KEY_UP": (0, -1),
     "KEY_DOWN": (0, 1),
@@ -90,6 +91,8 @@ MODE_TITLES = {"controls": "Controls", "volume": "Volume", "cursor": "Cursor"}
 mode = "controls"
 cursor_held: set[str] = set()
 cursor_lock = threading.Lock()
+repeat_held: dict[str, tuple[int, bool]] = {}
+repeat_lock = threading.Lock()
 mouse_left_down = False
 mouse_right_down = False
 
@@ -650,6 +653,8 @@ def toggle_mode(held: dict[str, tuple[int, bool]]) -> None:
     held.clear()
     with cursor_lock:
         cursor_held.clear()
+    with repeat_lock:
+        repeat_held.clear()
     release_mouse()
     mode = MODES[(MODES.index(mode) + 1) % len(MODES)]
     announce_mode()
@@ -674,12 +679,56 @@ def cursor_loop() -> None:
 threading.Thread(target=cursor_loop, daemon=True).start()
 
 
+def pulse_key(vk: int, extended: bool) -> None:
+    send_key(vk, extended, up=False)
+    send_key(vk, extended, up=True)
+
+
+def repeat_loop() -> None:
+    interval = 0.18
+    while True:
+        with repeat_lock:
+            keys = list(repeat_held.values())
+        if not keys:
+            interval = 0.18
+            time.sleep(0.03)
+            continue
+        time.sleep(interval)
+        with repeat_lock:
+            keys = list(repeat_held.values())
+        if not keys:
+            interval = 0.18
+            continue
+        for vk, extended in keys:
+            pulse_key(vk, extended)
+        interval = max(0.06, interval * 0.72)
+
+
+threading.Thread(target=repeat_loop, daemon=True).start()
+
+
 def apply_key(name: str, action: str, held: dict[str, tuple[int, bool]], seen_ignored: set[str]) -> None:
     global mouse_left_down
     if name == "KEY_SEARCH":
         if action == "DOWN":
             toggle_mode(held)
         return
+    if mode != "cursor" and name in REPEAT_KEYS:
+        mapped = binding_for(name)
+        if mapped is not None:
+            if action == "DOWN":
+                fresh = False
+                with repeat_lock:
+                    if name not in repeat_held:
+                        repeat_held[name] = mapped
+                        fresh = True
+                if fresh:
+                    pulse_key(mapped[0], mapped[1])
+                    print(name)
+            elif action == "UP":
+                with repeat_lock:
+                    repeat_held.pop(name, None)
+            return
     if mode == "cursor" and name in CURSOR_MOVE:
         with cursor_lock:
             if action == "DOWN":
@@ -700,6 +749,12 @@ def apply_key(name: str, action: str, held: dict[str, tuple[int, bool]], seen_ig
         if action == "DOWN":
             send_mouse(MOUSEEVENTF_RIGHTDOWN)
             send_mouse(MOUSEEVENTF_RIGHTUP)
+            print(name)
+        return
+    if mode == "controls" and name == "KEY_BACK":
+        if action == "DOWN":
+            send_key(0x7A, False, up=False)
+            send_key(0x7A, False, up=True)
             print(name)
         return
     chord = CHORDS.get(name)
