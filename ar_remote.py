@@ -8,17 +8,21 @@ from __future__ import annotations
 
 import argparse
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 import winsound
+import zipfile
 from pathlib import Path
 
 import ctypes
 from ctypes import wintypes
 
 ADB = Path.home() / "AppData/Local/Android/platform-tools/adb.exe"
+PLATFORM_TOOLS_URL = "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
 ENDPOINT_FILE = Path(__file__).with_name("endpoint.txt")
 SOUND_FILE = Path(__file__).with_name("sound.txt")
 CHIME_FILE = Path(__file__).with_name("mode.wav")
@@ -214,10 +218,84 @@ def send_mouse(flags: int, dx: int = 0, dy: int = 0) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def adb_bin() -> str:
+def say(message: str) -> None:
+    if sys.stdout is not None:
+        print(message)
+
+
+def ensure_adb() -> str:
+    """Use a local adb, one already on PATH, or download Google's platform-tools."""
     if ADB.exists():
         return str(ADB)
-    return "adb"
+    found = shutil.which("adb")
+    if found:
+        return found
+    say("Downloading Android platform-tools (adb). This happens once.")
+    dest_root = ADB.parent.parent
+    dest_root.mkdir(parents=True, exist_ok=True)
+    zip_path = dest_root / "platform-tools.zip"
+    try:
+        urllib.request.urlretrieve(PLATFORM_TOOLS_URL, zip_path)
+        with zipfile.ZipFile(zip_path) as archive:
+            archive.extractall(dest_root)
+    finally:
+        zip_path.unlink(missing_ok=True)
+    if not ADB.exists():
+        raise SystemExit(f"adb download finished, but {ADB} is missing.")
+    say(f"adb is at {ADB}")
+    return str(ADB)
+
+
+def adb_bin() -> str:
+    return ensure_adb()
+
+
+def pythonw_path() -> Path:
+    candidate = Path(sys.executable).with_name("pythonw.exe")
+    if candidate.exists():
+        return candidate
+    return Path(sys.executable)
+
+
+def ps_quote(value: Path | str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def install_shortcuts() -> None:
+    pythonw = pythonw_path()
+    script = Path(__file__).resolve()
+    ps1 = script.with_name("_shortcuts.ps1")
+    ps1.write_text(
+        "\n".join(
+            [
+                "$shell = New-Object -ComObject WScript.Shell",
+                "$desktop = [Environment]::GetFolderPath('Desktop')",
+                "$startup = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs\\Startup'",
+                f"$target = {ps_quote(pythonw)}",
+                f"$script = {ps_quote(script)}",
+                f"$work = {ps_quote(script.parent)}",
+                "foreach ($dir in @($desktop, $startup)) {",
+                "  $link = $shell.CreateShortcut((Join-Path $dir 'Fire Remote.lnk'))",
+                "  $link.TargetPath = $target",
+                "  $link.Arguments = '\"' + $script + '\" --tray'",
+                "  $link.WorkingDirectory = $work",
+                "  $link.WindowStyle = 7",
+                "  $link.Description = 'Toggle the Fire TV remote on this PC'",
+                "  $link.Save()",
+                "}",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
+            check=True,
+            creationflags=NO_WINDOW,
+        )
+    finally:
+        ps1.unlink(missing_ok=True)
+    say("Shortcuts are on the desktop and in Startup. The tray icon starts off.")
 
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -274,6 +352,67 @@ def discover_mdns() -> list[str]:
     return found
 
 
+NETWORK_WARNING = """
+DO NOT DO THIS ON PUBLIC WI-FI.
+
+Use a private network you trust, such as your home Wi-Fi.
+A cafe, hotel, airport, school, or guest network is not safe.
+
+Wireless debugging lets this PC run commands on the phone:
+install apps, read files, and control the screen. Anyone else
+on that same network who pairs with the phone can do the same.
+Turn Wireless debugging off when you are done, and leave it off
+away from home.
+"""
+
+
+def confirm_private_network() -> None:
+    say(NETWORK_WARNING)
+    answer = input("Type YES to continue on a private network: ").strip()
+    if answer != "YES":
+        raise SystemExit("Stopped. Connect to a private network, then run this again.")
+
+
+def remember_device(endpoint: str) -> bool:
+    if not connect_endpoint(endpoint):
+        return False
+    devices = parse_devices(adb_text(["devices"]))
+    if any(serial == endpoint and state == "device" for serial, state in devices):
+        ENDPOINT_FILE.write_text(endpoint, encoding="utf-8")
+        say(f"Phone saved at {endpoint}")
+        return True
+    return False
+
+
+def pair_phone() -> None:
+    """Pair over Wi-Fi with the code on the phone. No USB cable."""
+    confirm_private_network()
+    ensure_adb()
+    run_adb(["start-server"])
+    say("On the phone, open Developer options, then Wireless debugging.")
+    say("Tap Pair device with pairing code and leave that popup open.")
+    endpoint = input("IP and port from the popup, such as 192.168.1.20:37123: ").strip()
+    code = input("6-digit pairing code: ").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+:\d+", endpoint) or not re.fullmatch(r"\d{6}", code):
+        raise SystemExit("Use the IP, port, and 6-digit code shown on the phone popup.")
+    text = adb_text(["pair", endpoint, code], timeout=40)
+    say(text.strip())
+    if "successfully paired" not in text.lower():
+        raise SystemExit("Pairing failed. The code expires quickly. Open the popup again and retry.")
+    time.sleep(1)
+    for found in discover_mdns():
+        if remember_device(found):
+            say("Paired over Wi-Fi. You can close the popup.")
+            return
+    say("Paired. Close the popup and read IP address & Port on the Wireless debugging page.")
+    connect_to = input("IP and port from that page: ").strip()
+    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+:\d+", connect_to):
+        raise SystemExit("That is not an IP and port. Look at the Wireless debugging page again.")
+    if not remember_device(connect_to):
+        raise SystemExit(f"Could not connect to {connect_to}. Check Wireless debugging is still on.")
+    say("Paired over Wi-Fi. Unplug any cable. The tray icon is the switch from here.")
+
+
 def choose_serial() -> str:
     """Prefer an authorized Wi-Fi serial. Fall back to USB, then switch it to Wi-Fi."""
     saved = ENDPOINT_FILE.read_text(encoding="utf-8").strip() if ENDPOINT_FILE.exists() else ""
@@ -321,7 +460,7 @@ def choose_serial() -> str:
             "and check 'Always allow from this computer'."
         )
     raise SystemExit(
-        "No phone found. Plug it in once with USB debugging on, or turn Wireless debugging back on."
+        "No phone found. On a private network, run: python ar_remote.py --pair"
     )
 
 
@@ -774,7 +913,19 @@ def main() -> None:
     parser.add_argument("--list", action="store_true", help="Print input devices and exit.")
     parser.add_argument("--tray", action="store_true", help="Show a tray toggle instead of running in this window.")
     parser.add_argument("--on", action="store_true", help="With --tray, start already forwarding.")
+    parser.add_argument("--setup", action="store_true", help="Download adb if needed and create shortcuts.")
+    parser.add_argument("--pair", action="store_true", help="Pair the phone over Wi-Fi. No USB cable.")
     args = parser.parse_args()
+
+    if args.pair:
+        pair_phone()
+        return
+
+    if args.setup:
+        ensure_adb()
+        install_shortcuts()
+        say("Next, on a private network: python ar_remote.py --pair")
+        return
 
     if args.tray:
         serve_tray(args.on)

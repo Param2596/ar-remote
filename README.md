@@ -6,50 +6,56 @@ The remote stays paired to the phone over Bluetooth. The phone and the PC talk o
 
 Windows only. You need a phone that can pair the remote.
 
+## Do not use public Wi-Fi
+
+**Do this only on a private network you trust, such as your home Wi-Fi.** A cafe, hotel, airport, school, or guest network is not safe.
+
+Wireless debugging is not a harmless switch. While it is on, a computer on that network can run commands on the phone: install and remove apps, read files, and control the screen. This project uses that channel to read the remote. Anyone else who pairs with the phone on the same network can do the same things.
+
+Turn **Wireless debugging** off when you are finished, and leave it off when you are away from home. `setup.bat` stops and asks you to type `YES` before it will pair.
+
+A VPN that blocks the local network, such as GlobalProtect, will also stop the PC from reaching the phone. Turn that off while you use the remote.
+
 ## What you need
 
 - Windows 10 or 11
 - Python 3.11 or newer, from [python.org](https://www.python.org/downloads/). During setup, turn on **Add python.exe to PATH**. Skip the Microsoft Store alias if Windows offers one.
-- An Android phone on the same Wi-Fi as the PC
+- An Android phone on the same private Wi-Fi as the PC
 - The Fire remote paired to that phone in Bluetooth settings
-- [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`)
 
-A VPN that blocks the local network, such as GlobalProtect, will stop the PC from reaching the phone. Turn that off while you use the remote.
+`adb` is downloaded for you the first time you run setup. You do not install platform-tools yourself.
 
 ## Install
+
+Install Python 3 from [python.org](https://www.python.org/downloads/) and turn on **Add python.exe to PATH**. Skip the Microsoft Store alias if Windows offers one.
+
+Be on your home Wi-Fi, or another private network. Clone the repo, then double-click `setup.bat`:
 
 ```bat
 git clone https://github.com/Param2596/ar-remote.git
 cd ar-remote
-pip install -r requirements.txt
 ```
 
-Unzip platform-tools so `adb.exe` is here:
+`setup.bat` installs the tray libraries, downloads `adb` if it is missing, and puts a **Fire Remote** shortcut on the desktop and in Startup. The Startup shortcut comes up off, so the phone keeps the remote until you click the icon.
 
-```text
-%LOCALAPPDATA%\Android\platform-tools\adb.exe
-```
-
-That is `C:\Users\<you>\AppData\Local\Android\platform-tools\adb.exe`. The script looks for `adb` at that path.
-
-## First connection
+Then it pairs the phone over Wi-Fi. No cable.
 
 On the phone:
 
-1. Turn on Developer options.
-2. Turn on **USB debugging**.
-3. Turn on **Wireless debugging**.
-4. Pair the Fire remote in Bluetooth settings and confirm the phone can navigate with it.
+1. Turn on Developer options and **Wireless debugging**.
+2. Pair the Fire remote in Bluetooth settings.
+3. Tap **Pair device with pairing code** and leave the popup open.
+4. Type the popup's IP, port, and 6-digit code into the setup window.
 
-Plug the phone into the PC with a cable. If the phone asks, tap **Allow** and check **Always allow from this computer**.
+The code expires quickly. If pairing fails, open the popup again. If the PC still cannot see the phone, close the popup and type the **IP address & Port** from the main Wireless debugging page.
 
-Start the tray app:
+Click the round icon by the clock. Gray is off, green is on.
+
+To pair again later:
 
 ```bat
-pythonw ar_remote.py --tray
+python ar_remote.py --pair
 ```
-
-A round icon appears by the clock. Gray means off, green means on. Click it once. The first time, with the cable still plugged in, the script switches the phone to Wi-Fi debugging on port 5555. The phone may ask you to **Allow** again. After that, unplug the cable.
 
 If nothing connects, run it in a window so you can read the error:
 
@@ -61,11 +67,13 @@ python ar_remote.py
 
 ## Daily use
 
-Leave these on whenever the tray icon is green:
+Leave these on whenever the tray icon is green, and only while you are on that private network:
 
 - Phone Bluetooth, with the remote connected
 - Wireless debugging
-- Phone and PC on the same Wi-Fi
+- Phone and PC on the same home Wi-Fi
+
+If you go somewhere else, turn Wireless debugging off before you join that network.
 
 Click the tray icon to turn forwarding on or off. Off means the remote goes back to the phone.
 
@@ -79,15 +87,7 @@ Right-click the icon:
 
 After the phone reboots, turn Wireless debugging back on, then click the tray icon off and on.
 
-`run.bat` starts the tray app with no console window. It expects Python at `%LOCALAPPDATA%\Python\pythoncore-3.14-64\pythonw.exe`. If your Python lives somewhere else, start it with `pythonw ar_remote.py --tray` or point a shortcut at your own `pythonw.exe`.
-
-To start with Windows, put a shortcut in the Startup folder:
-
-```text
-%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup
-```
-
-Target your `pythonw.exe`, with arguments `"C:\path\to\ar-remote\ar_remote.py" --tray`. It comes up off, so the phone keeps the remote until you click the icon.
+`run.bat` opens the tray app again with no console window. `setup.bat` is only for the first install.
 
 ## Buttons
 
@@ -138,7 +138,7 @@ These are created locally and are not in the repo:
 
 ## When it stops working
 
-- **No phone found.** Wireless debugging is off, the phone is on another network, or a VPN is blocking LAN traffic. Plug in the cable once and click the tray icon again.
+- **No phone found.** Wireless debugging is off, the phone is on another network, or a VPN is blocking LAN traffic. On your home Wi-Fi, run `python ar_remote.py --pair` again.
 - **Not authorized.** Unlock the phone and tap Allow.
 - **The remote still drives the phone.** The tray icon is off, or the grabber on the phone is not running. Turn the icon off and on.
 - **Buttons do nothing on the PC.** Bluetooth dropped. Reconnect the remote to the phone, then toggle the tray icon.
