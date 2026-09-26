@@ -1,4 +1,6 @@
 __pycache__/
 endpoint.txt
 sound.txt
+bridge.txt
+button-listen.log
 _shortcuts.ps1
