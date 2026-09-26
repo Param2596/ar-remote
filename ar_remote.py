@@ -1,0 +1,816 @@
+"""Forward an Amazon Fire TV remote, paired to an Android phone, into Windows keys.
+
+The phone is the translator: it already understands the remote. This script
+reads that phone over adb (USB or Wi-Fi) and injects matching keys here.
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import threading
+import time
+import winsound
+from pathlib import Path
+
+import ctypes
+from ctypes import wintypes
+
+ADB = Path.home() / "AppData/Local/Android/platform-tools/adb.exe"
+ENDPOINT_FILE = Path(__file__).with_name("endpoint.txt")
+SOUND_FILE = Path(__file__).with_name("sound.txt")
+CHIME_FILE = Path(__file__).with_name("mode.wav")
+REMOTE_NAME_HINTS = ("ar keyboard", "ar", "amazon", "fire tv", "firetv")
+
+# Linux evdev name -> (virtual-key, extended).
+# Power stays unmapped. Alexa toggles between this map and VOLUME_MAP.
+KEY_MAP: dict[str, tuple[int, bool]] = {
+    "KEY_UP": (0x26, True),
+    "KEY_DOWN": (0x28, True),
+    "KEY_LEFT": (0x25, True),
+    "KEY_RIGHT": (0x27, True),
+    "KEY_ENTER": (0x0D, False),
+    "KEY_SELECT": (0x0D, False),
+    "KEY_KPENTER": (0x0D, False),
+    "KEY_BACK": (0x1B, False),
+    "KEY_ESC": (0x1B, False),
+    "KEY_HOME": (0x5B, True),
+    "KEY_HOMEPAGE": (0x5B, True),
+    "KEY_MENU": (0x5D, True),
+    "KEY_PLAYPAUSE": (0xB3, False),
+    "KEY_PLAY": (0xB3, False),
+    "KEY_PAUSE": (0xB3, False),
+    "KEY_REWIND": (0xB1, False),
+    "KEY_PREVIOUSSONG": (0xB1, False),
+    "KEY_FASTFORWARD": (0xB0, False),
+    "KEY_NEXTSONG": (0xB0, False),
+    "KEY_VOLUMEUP": (0xAF, False),
+    "KEY_VOLUMEDOWN": (0xAE, False),
+    "KEY_MUTE": (0xAD, False),
+}
+
+# Fired once on press. Win+Tab opens Task View.
+CHORDS: dict[str, tuple[tuple[int, bool], ...]] = {
+    "KEY_PROGRAM": ((0x5B, True), (0x09, False)),
+}
+
+# Media pad. Mute and track keys are tapped once so mute does not flip twice.
+VOLUME_MAP: dict[str, tuple[int, bool]] = {
+    "KEY_UP": (0xAF, False),
+    "KEY_DOWN": (0xAE, False),
+    "KEY_LEFT": (0xB1, False),
+    "KEY_RIGHT": (0xB0, False),
+    "KEY_ENTER": (0xAD, False),
+    "KEY_SELECT": (0xAD, False),
+    "KEY_KPENTER": (0xAD, False),
+}
+TAP_KEYS = {0xAD, 0xB0, 0xB1}
+CURSOR_MOVE = {
+    "KEY_UP": (0, -1),
+    "KEY_DOWN": (0, 1),
+    "KEY_LEFT": (-1, 0),
+    "KEY_RIGHT": (1, 0),
+}
+CLICK_KEYS = {"KEY_ENTER", "KEY_SELECT", "KEY_KPENTER"}
+MODES = ("controls", "volume", "cursor")
+MODE_TITLES = {"controls": "Controls", "volume": "Volume", "cursor": "Cursor"}
+
+mode = "controls"
+cursor_held: set[str] = set()
+cursor_lock = threading.Lock()
+mouse_left_down = False
+mouse_right_down = False
+
+IGNORED = {"KEY_POWER", "KEY_SLEEP", "KEY_VOICECOMMAND", "KEY_ASSISTANT"}
+EVENT_RE = re.compile(r"EV_KEY\s+(\S+)\s+(DOWN|UP|REPEAT)")
+CODE_TO_NAME = {
+    103: "KEY_UP",
+    108: "KEY_DOWN",
+    105: "KEY_LEFT",
+    106: "KEY_RIGHT",
+    28: "KEY_ENTER",
+    96: "KEY_KPENTER",
+    353: "KEY_SELECT",
+    158: "KEY_BACK",
+    1: "KEY_ESC",
+    102: "KEY_HOME",
+    172: "KEY_HOMEPAGE",
+    139: "KEY_MENU",
+    164: "KEY_PLAYPAUSE",
+    207: "KEY_PLAY",
+    119: "KEY_PAUSE",
+    168: "KEY_REWIND",
+    165: "KEY_PREVIOUSSONG",
+    208: "KEY_FASTFORWARD",
+    163: "KEY_NEXTSONG",
+    115: "KEY_VOLUMEUP",
+    114: "KEY_VOLUMEDOWN",
+    113: "KEY_MUTE",
+    116: "KEY_POWER",
+    142: "KEY_SLEEP",
+    582: "KEY_VOICECOMMAND",
+    583: "KEY_ASSISTANT",
+    362: "KEY_PROGRAM",
+    217: "KEY_SEARCH",
+}
+# Keys that must be released on startup. Home used to hold the Windows key down,
+# which made every later button look like it did nothing.
+STUCK_KEYS = (
+    (0x5B, True),
+    (0x5C, True),
+    (0x5D, True),
+    (0x10, False),
+    (0x11, False),
+    (0x12, False),
+    (0xA0, False),
+    (0xA1, False),
+    (0xA2, False),
+    (0xA3, False),
+    (0xA4, False),
+    (0xA5, False),
+    (0x25, True),
+    (0x26, True),
+    (0x27, True),
+    (0x28, True),
+    (0x0D, False),
+    (0x1B, False),
+    (0xAC, False),
+)
+
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = (
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = (
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    )
+
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = (
+        ("uMsg", wintypes.DWORD),
+        ("wParamL", wintypes.WORD),
+        ("wParamH", wintypes.WORD),
+    )
+
+
+class INPUTUNION(ctypes.Union):
+    _fields_ = (("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT))
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = (("type", wintypes.DWORD), ("union", INPUTUNION))
+
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+user32.SendInput.restype = wintypes.UINT
+
+
+def send_key(vk: int, extended: bool, up: bool) -> None:
+    flags = 0
+    if extended:
+        flags |= KEYEVENTF_EXTENDEDKEY
+    if up:
+        flags |= KEYEVENTF_KEYUP
+    inp = INPUT(type=INPUT_KEYBOARD)
+    inp.union.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=flags, time=0, dwExtraInfo=0)
+    sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if sent != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def send_mouse(flags: int, dx: int = 0, dy: int = 0) -> None:
+    inp = INPUT(type=INPUT_MOUSE)
+    inp.union.mi = MOUSEINPUT(dx=dx, dy=dy, mouseData=0, dwFlags=flags, time=0, dwExtraInfo=0)
+    sent = user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT))
+    if sent != 1:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def adb_bin() -> str:
+    if ADB.exists():
+        return str(ADB)
+    return "adb"
+
+
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def run_adb(args: list[str], timeout: float = 15) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [adb_bin(), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=NO_WINDOW,
+    )
+
+
+def adb_text(args: list[str], timeout: float = 15) -> str:
+    result = run_adb(args, timeout=timeout)
+    return (result.stdout or "") + (result.stderr or "")
+
+
+def parse_devices(text: str) -> list[tuple[str, str]]:
+    devices = []
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[1] in {"device", "unauthorized", "offline"}:
+            if parts[0] != "List":
+                devices.append((parts[0], parts[1]))
+    return devices
+
+
+def phone_ip(serial: str) -> str | None:
+    text = adb_text(["-s", serial, "shell", "ip", "-4", "route", "get", "1.0.0.1"])
+    match = re.search(r"\bsrc\s+(\d+\.\d+\.\d+\.\d+)", text)
+    return match.group(1) if match else None
+
+
+def connect_endpoint(endpoint: str) -> bool:
+    text = adb_text(["connect", endpoint])
+    print(text.strip())
+    return "connected" in text.lower() or "already connected" in text.lower()
+
+
+def discover_mdns() -> list[str]:
+    text = adb_text(["mdns", "services"])
+    found = []
+    for line in text.splitlines():
+        if "_adb-tls-connect._tcp" not in line:
+            continue
+        match = re.search(r"(\d+\.\d+\.\d+\.\d+:\d+)", line)
+        if match:
+            found.append(match.group(1))
+    return found
+
+
+def choose_serial() -> str:
+    """Prefer an authorized Wi-Fi serial. Fall back to USB, then switch it to Wi-Fi."""
+    saved = ENDPOINT_FILE.read_text(encoding="utf-8").strip() if ENDPOINT_FILE.exists() else ""
+    if saved:
+        connect_endpoint(saved)
+
+    for endpoint in discover_mdns():
+        connect_endpoint(endpoint)
+
+    devices = parse_devices(adb_text(["devices", "-l"]))
+    authorized = [serial for serial, state in devices if state == "device"]
+    wireless = [serial for serial in authorized if ":" in serial]
+    if wireless:
+        ENDPOINT_FILE.write_text(wireless[0], encoding="utf-8")
+        return wireless[0]
+
+    usb = [serial for serial in authorized if ":" not in serial]
+    if usb:
+        serial = usb[0]
+        ip = phone_ip(serial)
+        if ip:
+            print(f"USB is up. Switching {serial} to Wi-Fi at {ip}:5555")
+            print(adb_text(["-s", serial, "tcpip", "5555"]).strip())
+            time.sleep(1.5)
+            endpoint = f"{ip}:5555"
+            connect_endpoint(endpoint)
+            ENDPOINT_FILE.write_text(endpoint, encoding="utf-8")
+            # Give the phone a moment to show the Allow prompt for the new socket.
+            for _ in range(20):
+                devices = parse_devices(adb_text(["devices"]))
+                states = {name: state for name, state in devices}
+                if states.get(endpoint) == "device":
+                    return endpoint
+                time.sleep(0.5)
+            raise SystemExit(
+                f"Phone is at {endpoint} but has not authorized this PC yet. "
+                "Unlock the phone, tap Allow on the USB debugging prompt, then run this again."
+            )
+        return serial
+
+    pending = [serial for serial, state in devices if state == "unauthorized"]
+    if pending:
+        raise SystemExit(
+            "The phone is connected but not authorized. Unlock it, tap Allow, "
+            "and check 'Always allow from this computer'."
+        )
+    raise SystemExit(
+        "No phone found. Plug it in once with USB debugging on, or turn Wireless debugging back on."
+    )
+
+
+def find_remote(serial: str) -> tuple[str, str]:
+    text = adb_text(["-s", serial, "shell", "getevent", "-pl"], timeout=20)
+    devices: list[tuple[str, str, str]] = []
+    current_path = ""
+    current_name = ""
+    current_block: list[str] = []
+
+    def flush() -> None:
+        if current_path:
+            devices.append((current_path, current_name, "\n".join(current_block)))
+
+    for line in text.splitlines():
+        added = re.match(r"add device \d+:\s+(\S+)", line)
+        if added:
+            flush()
+            current_path = added.group(1)
+            current_name = ""
+            current_block = [line]
+            continue
+        current_block.append(line)
+        name = re.search(r'name:\s+"(.*)"', line)
+        if name:
+            current_name = name.group(1)
+    flush()
+
+    ranked: list[tuple[int, str, str]] = []
+    for path, name, block in devices:
+        score = 0
+        lowered = name.lower()
+        if lowered == "ar keyboard":
+            score += 100
+        elif any(hint in lowered for hint in REMOTE_NAME_HINTS):
+            score += 40
+        if "KEY_UP" in block and "KEY_ENTER" in block:
+            score += 10
+        if lowered in {"touchpanel", "gpio-keys", "pmic_pwrkey"}:
+            score -= 50
+        ranked.append((score, path, name))
+    ranked.sort(reverse=True)
+    if not ranked or ranked[0][0] <= 0:
+        names = ", ".join(f"{name} ({path})" for _, path, name in ranked) or "none"
+        raise SystemExit(f"Could not find the AR remote among input devices: {names}")
+    _, path, name = ranked[0]
+    return path, name
+
+
+def release_stuck_keys() -> None:
+    for vk, extended in STUCK_KEYS:
+        send_key(vk, extended, up=True)
+
+
+def send_chord(keys: tuple[tuple[int, bool], ...]) -> None:
+    for vk, extended in keys:
+        send_key(vk, extended, up=False)
+    for vk, extended in reversed(keys):
+        send_key(vk, extended, up=True)
+
+
+def binding_for(name: str) -> tuple[int, bool] | None:
+    if mode == "volume":
+        volume = VOLUME_MAP.get(name)
+        if volume is not None:
+            return volume
+    return KEY_MAP.get(name)
+
+
+class ModeLabel:
+    def __init__(self) -> None:
+        self.root = None
+        self.label = None
+        self.hide_job = None
+        self.ready = threading.Event()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError:
+            self.ready.set()
+            return
+        root = tk.Tk()
+        root.overrideredirect(True)
+        root.attributes("-topmost", True)
+        root.configure(bg="#1c1f18")
+        label = tk.Label(
+            root,
+            text="",
+            font=("Segoe UI", 15),
+            bg="#1c1f18",
+            fg="#f3f1e8",
+            padx=18,
+            pady=8,
+        )
+        label.pack()
+        root.withdraw()
+        self.root = root
+        self.label = label
+        self.ready.set()
+        root.mainloop()
+
+    def show(self, title: str) -> None:
+        if not self.ready.wait(0.5) or self.root is None:
+            return
+
+        def go() -> None:
+            self.label.configure(text=title)
+            self.root.update_idletasks()
+            width = self.root.winfo_reqwidth()
+            x = max(0, (self.root.winfo_screenwidth() - width) // 2)
+            self.root.geometry(f"+{x}+36")
+            self.root.deiconify()
+            self.root.lift()
+            if self.hide_job is not None:
+                self.root.after_cancel(self.hide_job)
+            self.hide_job = self.root.after(1600, self.root.withdraw)
+
+        self.root.after(0, go)
+
+
+mode_label = ModeLabel()
+
+
+def load_sound_enabled() -> bool:
+    try:
+        return SOUND_FILE.read_text(encoding="utf-8").strip() != "off"
+    except OSError:
+        return True
+
+
+def save_sound_enabled(enabled: bool) -> None:
+    SOUND_FILE.write_text("on" if enabled else "off", encoding="utf-8")
+
+
+def load_chime() -> bytes:
+    # Kenney Interface Sounds, bong_001. CC0, https://kenney.nl/assets/interface-sounds
+    try:
+        return CHIME_FILE.read_bytes()
+    except OSError:
+        return b""
+
+
+CHIME = load_chime()
+sound_enabled = load_sound_enabled()
+
+
+def play_chime() -> None:
+    if not sound_enabled or not CHIME:
+        return
+    # Synchronous on purpose. An async play is tied to the calling thread, and
+    # the mode-switch thread exits immediately, which cuts the chime off.
+    try:
+        winsound.PlaySound(CHIME, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+    except RuntimeError:
+        pass
+
+
+def announce_mode() -> None:
+    title = MODE_TITLES[mode]
+    print(f"mode: {mode}")
+    mode_label.show(title)
+    threading.Thread(target=play_chime, daemon=True).start()
+
+
+def release_mouse() -> None:
+    global mouse_left_down, mouse_right_down
+    if mouse_left_down:
+        send_mouse(MOUSEEVENTF_LEFTUP)
+        mouse_left_down = False
+    if mouse_right_down:
+        send_mouse(MOUSEEVENTF_RIGHTUP)
+        mouse_right_down = False
+
+
+def toggle_mode(held: dict[str, tuple[int, bool]]) -> None:
+    global mode
+    for vk, extended in list(held.values()):
+        send_key(vk, extended, up=True)
+    held.clear()
+    with cursor_lock:
+        cursor_held.clear()
+    release_mouse()
+    mode = MODES[(MODES.index(mode) + 1) % len(MODES)]
+    announce_mode()
+
+
+def cursor_loop() -> None:
+    speed = 10.0
+    while True:
+        with cursor_lock:
+            names = set(cursor_held)
+        dx = sum(CURSOR_MOVE[name][0] for name in names)
+        dy = sum(CURSOR_MOVE[name][1] for name in names)
+        if dx or dy:
+            send_mouse(MOUSEEVENTF_MOVE, int(dx * speed), int(dy * speed))
+            speed = min(48.0, speed + 2.2)
+            time.sleep(0.016)
+        else:
+            speed = 10.0
+            time.sleep(0.03)
+
+
+threading.Thread(target=cursor_loop, daemon=True).start()
+
+
+def apply_key(name: str, action: str, held: dict[str, tuple[int, bool]], seen_ignored: set[str]) -> None:
+    global mouse_left_down
+    if name == "KEY_SEARCH":
+        if action == "DOWN":
+            toggle_mode(held)
+        return
+    if mode == "cursor" and name in CURSOR_MOVE:
+        with cursor_lock:
+            if action == "DOWN":
+                cursor_held.add(name)
+            elif action == "UP":
+                cursor_held.discard(name)
+        return
+    if mode == "cursor" and name in CLICK_KEYS:
+        if action == "DOWN" and not mouse_left_down:
+            send_mouse(MOUSEEVENTF_LEFTDOWN)
+            mouse_left_down = True
+            print(name)
+        elif action == "UP" and mouse_left_down:
+            send_mouse(MOUSEEVENTF_LEFTUP)
+            mouse_left_down = False
+        return
+    if mode == "cursor" and name == "KEY_MENU":
+        if action == "DOWN":
+            send_mouse(MOUSEEVENTF_RIGHTDOWN)
+            send_mouse(MOUSEEVENTF_RIGHTUP)
+            print(name)
+        return
+    chord = CHORDS.get(name)
+    if chord is not None:
+        if action == "DOWN":
+            send_chord(chord)
+            print(name)
+        return
+    if name in IGNORED:
+        if name not in seen_ignored:
+            print(f"{name} ignored")
+            seen_ignored.add(name)
+        return
+    mapped = binding_for(name)
+    if mapped is None:
+        if action == "DOWN":
+            print(f"unmapped {name}")
+        return
+    if action == "REPEAT":
+        return
+    if action == "DOWN":
+        if mapped[0] in TAP_KEYS:
+            send_key(mapped[0], mapped[1], up=False)
+            send_key(mapped[0], mapped[1], up=True)
+            print(name)
+            return
+        if name in held:
+            return
+        held[name] = mapped
+        send_key(mapped[0], mapped[1], up=False)
+        print(name)
+        return
+    pressed = held.pop(name, None)
+    if pressed is None:
+        return
+    send_key(pressed[0], pressed[1], up=True)
+
+
+def install_grabber(serial: str) -> None:
+    binary = Path(__file__).with_name("grabevent")
+    if not binary.exists():
+        raise SystemExit("grabevent is missing. Run build_grabevent.py first.")
+    pushed = run_adb(["-s", serial, "push", str(binary), "/data/local/tmp/grabevent"])
+    if pushed.returncode != 0:
+        raise SystemExit(pushed.stdout + pushed.stderr)
+    run_adb(["-s", serial, "shell", "chmod", "755", "/data/local/tmp/grabevent"])
+
+
+class Bridge:
+    process: subprocess.Popen | None = None
+
+
+bridge = Bridge()
+
+
+def stream(serial: str, device: str, stop: threading.Event | None = None) -> None:
+    print("Listening. Alexa cycles Controls, Volume, and Cursor.")
+    print(f"mode: {mode}")
+    release_stuck_keys()
+    # Drop a previous grabber so this one can take the device.
+    run_adb(["-s", serial, "shell", "pkill grabevent"], timeout=5)
+    time.sleep(0.2)
+    # -tt forces a terminal on the phone, so each line is flushed instead of
+    # sitting in a buffer. Raw 24-byte packets over exec-out were the lag.
+    process = subprocess.Popen(
+        [adb_bin(), "-s", serial, "shell", "-tt", "/data/local/tmp/grabevent", device],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        creationflags=NO_WINDOW,
+    )
+    bridge.process = process
+    held: dict[str, tuple[int, bool]] = {}
+    seen_ignored: set[str] = set()
+    pending = b""
+    assert process.stdout is not None
+    try:
+        while not (stop is not None and stop.is_set()):
+            incoming = process.stdout.read(128)
+            if not incoming:
+                code = process.wait(timeout=3)
+                if code == 2:
+                    raise ConnectionError("phone refused to hand over the remote")
+                raise ConnectionError("adb closed the button stream")
+            pending += incoming
+            while b"\n" in pending:
+                line, pending = pending.split(b"\n", 1)
+                match = re.search(rb"(\d+)\s+(\d+)", line)
+                if not match:
+                    continue
+                code = int(match.group(1))
+                value = int(match.group(2))
+                name = CODE_TO_NAME.get(code, f"KEY_{code}")
+                action = {0: "UP", 1: "DOWN", 2: "REPEAT"}.get(value)
+                if action is None:
+                    continue
+                apply_key(name, action, held, seen_ignored)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return
+    finally:
+        for vk, extended in list(held.values()):
+            send_key(vk, extended, up=True)
+        release_stuck_keys()
+        if bridge.process is process:
+            bridge.process = None
+        process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        run_adb(["-s", serial, "shell", "pkill grabevent"], timeout=5)
+
+
+def run_forever(stop: threading.Event) -> None:
+    run_adb(["start-server"])
+    while not stop.is_set():
+        try:
+            serial = choose_serial()
+            path, name = find_remote(serial)
+            print(f"Phone {serial}")
+            print(f"Remote {name} at {path}")
+            install_grabber(serial)
+            release_stuck_keys()
+            stream(serial, path, stop)
+        except SystemExit as exc:
+            print(exc)
+        except Exception as exc:
+            if stop.is_set():
+                return
+            print(f"Stream dropped ({exc}). Reconnecting...")
+        if stop.wait(2):
+            return
+
+
+def tray_icon(on: bool):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    fill = (214, 242, 92, 255) if on else (90, 94, 82, 255)
+    draw.ellipse((8, 8, 56, 56), fill=fill)
+    return image
+
+
+def already_running() -> bool:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    global tray_mutex
+    tray_mutex = kernel32.CreateMutexW(None, False, "Local\\FireRemoteTray")
+    return ctypes.get_last_error() == 183
+
+
+def serve_tray(start_on: bool) -> None:
+    if already_running():
+        print("Fire remote toggle is already running in the tray.")
+        return
+    import pystray
+
+    state = {"on": False}
+    stop = threading.Event()
+    worker: dict[str, threading.Thread | None] = {"thread": None}
+
+    def set_on(on: bool) -> None:
+        if on == state["on"]:
+            return
+        if on:
+            stop.clear()
+            thread = threading.Thread(target=run_forever, args=(stop,), daemon=True)
+            worker["thread"] = thread
+            thread.start()
+        else:
+            stop.set()
+            if bridge.process is not None:
+                bridge.process.kill()
+            thread = worker["thread"]
+            if thread is not None:
+                thread.join(timeout=8)
+        state["on"] = on
+        icon.icon = tray_icon(on)
+        icon.title = "Fire remote: On" if on else "Fire remote: Off"
+
+    def toggle(icon, item) -> None:
+        set_on(not state["on"])
+
+    def quit_app(icon, item) -> None:
+        set_on(False)
+        icon.stop()
+
+    def toggle_sound(icon, item) -> None:
+        global sound_enabled
+        sound_enabled = not sound_enabled
+        save_sound_enabled(sound_enabled)
+        if sound_enabled:
+            threading.Thread(target=play_chime, daemon=True).start()
+
+    icon = pystray.Icon(
+        "fire-remote",
+        tray_icon(False),
+        "Fire remote: Off",
+        menu=pystray.Menu(
+            pystray.MenuItem("Use remote on this PC", toggle, checked=lambda item: state["on"], default=True),
+            pystray.MenuItem("Mode sound", toggle_sound, checked=lambda item: sound_enabled),
+            pystray.MenuItem("Quit", quit_app),
+        ),
+    )
+
+    def setup(icon) -> None:
+        icon.visible = True
+        if start_on:
+            set_on(True)
+
+    icon.run(setup)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Forward the Fire TV remote on your phone to this PC.")
+    parser.add_argument("--list", action="store_true", help="Print input devices and exit.")
+    parser.add_argument("--tray", action="store_true", help="Show a tray toggle instead of running in this window.")
+    parser.add_argument("--on", action="store_true", help="With --tray, start already forwarding.")
+    args = parser.parse_args()
+
+    if args.tray:
+        serve_tray(args.on)
+        return
+
+    run_adb(["start-server"])
+    serial = choose_serial()
+    path, name = find_remote(serial)
+    print(f"Phone {serial}")
+    print(f"Remote {name} at {path}")
+    if args.list:
+        return
+    install_grabber(serial)
+    release_stuck_keys()
+    stop = threading.Event()
+    while not stop.is_set():
+        try:
+            stream(serial, path, stop)
+            return
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            return
+        except Exception as exc:
+            print(f"Stream dropped ({exc}). Reconnecting...")
+            time.sleep(2)
+            try:
+                serial = choose_serial()
+                path, name = find_remote(serial)
+                print(f"Reconnected to {name} via {serial}")
+            except SystemExit as exit_exc:
+                print(exit_exc)
+                time.sleep(3)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
