@@ -459,7 +459,7 @@ def save_sound_enabled(enabled: bool) -> None:
 
 
 def load_chime() -> bytes:
-    # Kenney Interface Sounds, bong_001. CC0, https://kenney.nl/assets/interface-sounds
+    # Thanks to Kenney for bong_001 from Interface Sounds: https://kenney.nl/assets/interface-sounds
     try:
         return CHIME_FILE.read_bytes()
     except OSError:

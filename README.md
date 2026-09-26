@@ -155,4 +155,4 @@ python build_grabevent.py
 
 ## Sound
 
-The mode chime is `bong_001` from [Kenney Interface Sounds](https://kenney.nl/assets/interface-sounds), used under CC0. Credit to Kenney is appreciated and not required.
+The mode chime is `bong_001` from [Kenney Interface Sounds](https://kenney.nl/assets/interface-sounds). Thanks to Kenney for making that pack and letting people use it.
