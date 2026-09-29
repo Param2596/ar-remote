@@ -43,8 +43,8 @@ Install Python 3 from [python.org](https://www.python.org/downloads/) and turn o
 On your home Wi-Fi, clone the repo and double-click `setup.bat`:
 
 ```bat
-git clone https://github.com/Param2596/ar-remote.git
-cd ar-remote
+git clone https://github.com/Param2596/firestick-pc-remote.git
+cd firestick-pc-remote
 ```
 
 `setup.bat` installs the tray libraries, downloads `adb` if it is missing, and puts a **Fire Remote** shortcut on the desktop and in Startup. The Startup shortcut comes up off, so the phone keeps the remote until you click the icon. Then it asks for the phone's pairing code. No cable.
@@ -97,7 +97,7 @@ Alexa cycles three modes: **Controls**, **Volume**, **Cursor**. A label appears 
 | --- | --- |
 | Up, Down, Left, Right | Arrow keys. A tap is one step. Holding speeds it up. |
 | Center | Enter |
-| Back | Full screen (F11) |
+| Back | Escape |
 | Home | Windows key |
 | Menu | Tab. A tap is one step. Holding speeds it up. |
 | Play / Pause | Play / Pause |
@@ -114,7 +114,7 @@ Alexa cycles three modes: **Controls**, **Volume**, **Cursor**. A label appears 
 | Center | Mute |
 | Alexa | Next mode |
 
-Home, Menu, Play / Pause, Rewind, and Fast forward still do what they do in Controls. Back is Escape here.
+Home, Menu, Play / Pause, Rewind, and Fast forward still do what they do in Controls. Back is Escape.
 
 ### Cursor
 
